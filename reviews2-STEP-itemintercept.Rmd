@@ -1,0 +1,359 @@
+---
+title: "reviews2_surprisal-agreement-intercept"
+author: "S. Slaats"
+date: "2025-02-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# load packages
+library(emmeans)
+library(plyr)
+library(dplyr)
+library(lme4)
+library(gridExtra)
+library(grid)
+library(lmerTest)
+library(car)
+library(MAP)
+library(broom)
+library(tidyverse)
+library(cAIC4)
+library(writexl)
+library(ggplot2)
+library(patchwork)
+
+emm_options(lmerTest.limit = 5000)
+```
+
+# Model selection using STEP
+## Loading the data
+```{r loading, include=TRUE}
+
+# working directory
+setwd("//nasac-faculty.isis.unige.ch/MEDECINE_HOME_PAPAT/Neufo/slaats/MPI/Project 3 - Behavioural studies/Project 3 - Behavioural studies")
+
+# load data 
+data <- read.csv('3 - SPR main/analysis/readingtimes_88pp_residuals_manual-outliers-REVIEWS.csv', header = TRUE)
+stiminfo <- read.csv('5 - metadata/frequency_length_position.csv', header = TRUE)
+
+# set factors
+data$agreement <- factor(data$agreement, levels=c('correct','incorrect'))
+data$surprisal <- factor(data$surprisal, levels=c('low','high'))
+data$correct_number <- factor(data$correct_number, levels=c("singular", "plural"))
+data$set_number <- factor(data$set_number)
+
+fmla <- 'logRTresidual ~ agreement * surprisal_value + agreement * correct_number + 
+                              (1 + agreement * surprisal_value + agreement * correct_number | UserId) + 
+                              (1 | set_number )'
+```
+
+```{r permutation settings, include=TRUE}
+n_permutations <- 1000
+seed <- 42
+set.seed(seed)
+
+# formula
+permute_lmer <- function(model_orig,
+                         data,
+                         n_permutations,
+                         group_var = "UserId",
+                         response_var = "logRTresidual",
+                         REML=FALSE,
+                         verbose=TRUE){
+  
+  formula <- formula(model_orig)
+  coef_names <- names(fixef(model_orig))
+  obs_coefs <- fixef(model_orig)
+  
+  # storage matrix (rows = perms, cols = fixed effects)
+  perm_matrix <- matrix(NA, nrow = n_permutations, ncol = length(coef_names))
+  colnames(perm_matrix) <- coef_names
+  
+  for (i in 1:n_permutations) {
+    # shuffle labels
+    data_perm <- data %>%
+      group_by(.data[[group_var]]) %>%
+        mutate(
+          !!response_var := sample(.data[[response_var]])
+        ) %>%
+        ungroup()
+    # Fit model to permuted data
+    tryCatch({
+      perm_model <- lmer(formula, data = data_perm, REML = REML)
+      perm_matrix[i, ] <- fixef(perm_model)
+    }, error = function(e) {
+      # Skip failed fits
+    })
+    
+    if (verbose && i %% 50 == 0) {
+      message(sprintf("Completed %d / %d permutations", i, n_permutations))
+    }
+    
+  }
+  
+  perm_matrix <- perm_matrix[complete.cases(perm_matrix), , drop = FALSE]
+  
+  p_values <- sapply(seq_along(obs_coefs), function(j) {
+    mean(abs(perm_matrix[, j]) >= abs(obs_coefs[j]))
+  })
+  names(p_values) <- coef_names
+  
+  return(list(
+    observed_coefs = obs_coefs,
+    permuted_coefs = perm_matrix,
+    p_values = p_values
+  ))
+
+}
+
+plot_permutation_densities <- function(result_list) {
+
+  permuted_df <- as.data.frame(result_list$permuted_coefs)
+  observed <- result_list$observed_coefs
+  pvals <- result_list$p_values
+  
+  coef_names <- setdiff(names(permuted_df), "(Intercept)")
+
+  plots <- lapply(coef_names, function(coef_name) {
+    ggplot(permuted_df, aes(x = .data[[coef_name]])) +
+      geom_density(fill = "skyblue", alpha = 0.5) +
+      geom_vline(xintercept = observed[coef_name], color = "red", linewidth = 1) +
+      labs(
+        title = sprintf("%s\n(p = %.3f)", coef_name, pvals[coef_name]),
+        x = "Coefficient value",
+        y = "Density"
+      ) +
+      theme_minimal(base_size=10) +
+      theme(plot.title = element_text(size = 10, hjust = 0.5))  # Center and shrink subplot titles
+  })
+
+    # Combine all plots into one figure
+  combined_plot <- wrap_plots(plots, ncol = length(plots)) +
+    plot_annotation(title = "Permutation Test Distributions for Fixed Effects",
+      theme = theme(plot.title = element_text(hjust = 0.5, size = 14))
+    )
+
+  return(combined_plot)
+}
+
+```
+
+# Continuous models
+## Word index 5 (target)
+```{r Word index 5, include=TRUE, message=FALSE, warning=FALSE}
+full5 <- lmer(fmla,
+             subset(data, word_index==5), 
+             control=lmerControl(optimizer="nloptwrap"), 
+             REML=FALSE)
+
+# Failed to converge
+# we try to use the 'step' function
+# this does not allow for selection of random correlations
+comparison5 <- step(full5, 
+                    alpha.random = 0.1,
+                    alpha.fixed = 0.05,
+                    reduce_fixed = TRUE,
+                    reduce_random = TRUE,
+                    )
+plot(comparison5)
+summary(comparison5)
+
+# the model: logRTresidual ~ agreement + correct_number + (agreement + surprisal_value + agreement:surprisal_value | set_number) + (agreement | UserId) + agreement:correct_number
+mdl5 <- get_model(comparison5)
+summary(mdl5)
+```
+### Permutation test for word index 5
+```{r word index 5 permutation, include=TRUE, message=FALSE, warning=FALSE}
+perm5 <- permute_lmer(mdl5,
+                      subset(data, word_index==5),
+                      n_permutations,
+                      verbose=TRUE)
+print(perm5$p_values)
+```
+
+```{r word index 5 viz permutation, fig.width=10,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots5 <- plot_permutation_densities(perm5)
+print(plots5)
+
+```
+
+### Simple effects
+```{r word index 5 EMMEANS, include=TRUE, message=FALSE, warning=FALSE}
+# agreement by number
+mdl5_agr_by_num <- emmeans(mdl5, specs='agreement', by='correct_number')
+
+# number by agreement
+mdl5_num_by_agr <- emmeans(mdl5, specs='correct_number', by='agreement')
+
+# get results without adjustment
+mdl5_agr_by_num_raw <- summary(pairs(mdl5_agr_by_num), adjust='none')
+mdl5_num_by_agr_raw <- summary(pairs(mdl5_num_by_agr), adjust='none')
+
+# extract pvalues
+all_pvals <- c(mdl5_agr_by_num_raw$p.value, mdl5_num_by_agr_raw$p.value)
+adj_pvals <- p.adjust(all_pvals, method='bonferroni')
+
+# extract pvalues
+mdl5_res_pair <- rbind(mdl5_agr_by_num_raw, mdl5_num_by_agr_raw)
+mdl5_res_pair$adj.p.value <- adj_pvals
+summary(mdl5_res_pair)
+``` 
+
+## Word index 6 (spill-over 1)
+```{r Word index 6, include=TRUE, message=FALSE, warning=FALSE}
+full6 <- lmer(fmla,
+             subset(data, word_index==6), 
+             control=lmerControl(optimizer="nloptwrap"), 
+             REML=FALSE)
+
+# Failed to converge
+# we try to use the 'step' function
+# this does not allow for selection of random correlations
+comparison6 <- step(full6,
+                    alpha.random = 0.1,
+                    alpha.fixed = 0.05,
+                    reduce_fixed = TRUE,
+                    reduce_random = TRUE,
+                    )
+plot(comparison6)
+summary(comparison6)
+
+# the model: "logRTresidual ~ agreement + correct_number + (agreement + surprisal_value + agreement:surprisal_value | set_number) + (agreement | UserId) + agreement:correct_number"
+mdl6 <- get_model(comparison6)
+summary(mdl6)
+```
+
+### Permutation test for word index 6
+```{r word index 6 permutation, include=TRUE, message=FALSE, warning=FALSE}
+perm6 <- permute_lmer(mdl6,
+                      subset(data, word_index==6),
+                      n_permutations,
+                      verbose=TRUE)
+print(perm6$p_values)
+```
+
+```{r word index 6 viz permutation, fig.width=12.5,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots6 <- plot_permutation_densities(perm6)
+print(plots6)
+```
+
+### Simple effects
+```{r word index 6 EMMEANS, include=TRUE, message=FALSE, warning=FALSE}
+# agreement by number
+mdl6_agr_by_num <- emmeans(mdl6, specs='agreement', by='correct_number')
+
+# number by agreement
+mdl6_num_by_agr <- emmeans(mdl6, specs='correct_number', by='agreement')
+
+# surprisal by agreement
+mdl6_sur_by_agr <- emtrends(mdl6, var='surprisal_value', specs='agreement')
+
+# get results without adjustment
+mdl6_agr_by_num_raw <- summary(pairs(mdl6_agr_by_num), adjust='none')
+mdl6_num_by_agr_raw <- summary(pairs(mdl6_num_by_agr), adjust='none')
+mdl6_sur_by_agr_raw <- summary(mdl6_sur_by_agr, infer = c(FALSE,TRUE))
+
+# extract pvalues
+all_pvals <- c(mdl6_agr_by_num_raw$p.value, mdl6_num_by_agr_raw$p.value, mdl6_sur_by_agr_raw$p.value) #,  mdl6_agr_by_sur_raw$p.value
+adj_pvals <- p.adjust(all_pvals, method='bonferroni')
+
+# extract pvalues
+mdl6_res_pair <- rbind(mdl6_agr_by_num_raw, mdl6_num_by_agr_raw, mdl6_sur_by_agr_raw) #mdl6_agr_by_sur_raw
+mdl6_res_pair$adj.p.value <- adj_pvals
+summary(mdl6_res_pair)
+``` 
+
+## Word index 7 (spill-over 2)
+```{r Word index 7, include=TRUE, message=FALSE, warning=FALSE}
+full7 <- lmer(fmla,
+             subset(data, word_index==7), 
+             control=lmerControl(optimizer="nloptwrap"), 
+             REML=FALSE)
+
+# Failed to converge
+# we try to use the 'step' function
+# this does not allow for selection of random correlations
+comparison7 <- step(full7,
+                    alpha.random = 0.1,
+                    alpha.fixed = 0.05,
+                    reduce_fixed = TRUE,
+                    reduce_random = TRUE,
+                    )
+plot(comparison7)
+summary(comparison7)
+
+# the model: 'logRTresidual ~ agreement + surprisal_value + (agreement + surprisal_value | set_number) + (agreement + surprisal_value | UserId)'
+mdl7 <- get_model(comparison7)
+summary(mdl7)
+```
+
+### Permutation test for word index 7
+```{r word index 7 permutation, include=TRUE, message=FALSE, warning=FALSE}
+perm7 <- permute_lmer(mdl7,
+                      subset(data, word_index==7),
+                      n_permutations,
+                      verbose=TRUE)
+print(perm7$p_values)
+```
+
+```{r word index 7 viz permutation, fig.width=5,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots7 <- plot_permutation_densities(perm7)
+print(plots7)
+```
+
+
+## Word index 8 (spill-over 3)
+```{r Word index 8, include=TRUE, message=FALSE, warning=FALSE}
+full8 <- lmer(fmla,
+             subset(data, word_index==8), 
+             control=lmerControl(optimizer="nloptwrap"), 
+             REML=FALSE)
+
+# Failed to converge
+# we try to use the 'step' function
+# this does not allow for selection of random correlations
+comparison8 <- step(full8,
+                    alpha.random = 0.1,
+                    alpha.fixed = 0.05,
+                    reduce_fixed = TRUE,
+                    reduce_random = TRUE,
+                    )
+plot(comparison8)
+summary(comparison8)
+
+# This one was unclear as of 01-05-2025
+# the model: logRTresidual ~ agreement + (agreement + surprisal_value | set_number) + (agreement + surprisal_value + agreement:surprisal_value | UserId)
+# did not converge -- error:
+# unable to evaluate scaled gradient
+# Model failed to converge: degenerate  Hessian with 1 negative eigenvalues
+mdl8 <- get_model(comparison8)
+summary(mdl8)
+```
+
+### Permutation test for word index 8
+```{r word index 8 permutation, include=TRUE, message=FALSE, warning=FALSE}
+perm8 <- permute_lmer(mdl8,
+                      subset(data, word_index==8),
+                      n_permutations,
+                      verbose=TRUE)
+print(perm8$p_values)
+```
+
+```{r word index 8 viz permutation, fig.width=2.5,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots8 <- plot_permutation_densities(perm8)
+print(plots8)
+```
+
+```{r saving results, echo=FALSE}
+writexl::write_xlsx(list("target_random" = cbind(rownames(as.data.frame(comparison5[1])), as.data.frame(comparison5[1])),
+                "target_fixed" = cbind(rownames(as.data.frame(comparison5[2])), as.data.frame(comparison5[2])),
+                "so1_random" = cbind(rownames(as.data.frame(comparison6[1])), as.data.frame(comparison6[1])),
+                "so1_fixed" = cbind(rownames(as.data.frame(comparison6[2])), as.data.frame(comparison6[2])),
+                "so2_random" = cbind(rownames(as.data.frame(comparison7[1])), as.data.frame(comparison7[1])),
+                "so2_fixed" = cbind(rownames(as.data.frame(comparison7[2])), as.data.frame(comparison7[2])),
+                "so3_random" = cbind(rownames(as.data.frame(comparison8[1])), as.data.frame(comparison8[1])),
+                "so3_fixed" = cbind(rownames(as.data.frame(comparison8[2])), as.data.frame(comparison8[2]))),
+                'C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/stats_modelcomp.xlsx')
+```

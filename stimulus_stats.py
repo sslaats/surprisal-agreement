@@ -12,7 +12,7 @@ import seaborn as sns
 import scipy.stats as stats
 
 #%%
-dpath = 'K:/Project/Project 3 - Behavioural studies/5 - metadata'
+dpath = 'C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/5 - metadata'
 fname = 'frequency_length_position.csv'
 
 stimuli = pd.read_csv(os.path.join(dpath, fname))
@@ -94,13 +94,13 @@ import statsmodels.api as sm
 from statsmodels.formula.api import ols
 
 surp_model = ols('surprisal_value ~ C(agreement) + C(cat_surprisal) + C(agreement):C(cat_surprisal)', data=stimuli.loc[stimuli['word_index'] == 5]).fit()
-surp_result = sm.stats.anova_lm(surp_model, type=2)
+surp_result = sm.stats.anova_lm(surp_model, type=3)
 print(surp_result)
 
 # %% print the means
 surpmeans = stimuli.loc[stimuli['word_index']==5].groupby(by=['agreement', 'cat_surprisal']).aggregate(mean=pd.NamedAgg('surprisal_value', np.mean), std=pd.NamedAgg('surprisal_value', np.std))
 
-# %%
+# %% wf
 wf_model = ols('word_frequency ~ C(agreement) + C(cat_surprisal) + C(agreement):C(cat_surprisal)', data=stimuli.loc[stimuli['word_index'] == 5]).fit()
 wf_result = sm.stats.anova_lm(wf_model, type=2)
 print(wf_result)
