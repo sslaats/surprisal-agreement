@@ -1,0 +1,572 @@
+---
+title: "Appendix B (categorical surprisal)"
+author: "S. Slaats"
+date: "2025-11-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# load packages
+library(emmeans)
+library(plyr)
+library(dplyr)
+library(lme4)
+library(gridExtra)
+library(grid)
+library(lmerTest)
+library(car)
+library(MAP)
+library(broom)
+library(tidyverse)
+library(cAIC4)
+library(writexl)
+library(ggplot2)
+library(patchwork)
+
+emm_options(lmerTest.limit = 5000)
+```
+
+# Model selection
+## Loading the data
+```{r loading, include=TRUE}
+
+# working directory
+setwd("C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/")
+
+# load data 
+data <- read.csv('3 - SPR main/analysis/readingtimes_88pp_residuals_manual-outliers-REVIEWS.csv', header = TRUE)
+stiminfo <- read.csv('5 - metadata/frequency_length_position.csv', header = TRUE)
+
+# set factors
+data$agreement <- factor(data$agreement, levels=c('correct','incorrect'))
+data$surprisal <- factor(data$surprisal, levels=c('low','high'))
+data$correct_number <- factor(data$correct_number, levels=c("singular", "plural"))
+data$set_number <- factor(data$set_number)
+
+fmla <- 'logRTresidual ~ agreement * surprisal + agreement * correct_number + 
+                              (1 + agreement * surprisal + agreement * correct_number | UserId) + 
+                              (1 + agreement * surprisal | set_number )'
+
+fixed <-  'logRTresidual ~ agreement * surprisal + agreement * correct_number'
+
+fixed_effects <- list('logRTresidual ~ agreement * surprisal + agreement * correct_number', # 1
+                      'logRTresidual ~ surprisal + agreement * correct_number',             # 2
+                      'logRTresidual ~ agreement * correct_number',                         # 3
+                      'logRTresidual ~ agreement * surprisal + correct_number',             # 4
+                      'logRTresidual ~ agreement * surprisal',                              # 5
+                      'logRTresidual ~ surprisal + agreement + correct_number',             # 6
+                      'logRTresidual ~ agreement + correct_number',                         # 7
+                      'logRTresidual ~ surprisal + correct_number',                         # 8
+                      'logRTresidual ~ surprisal + agreement',                              # 9
+                      'logRTresidual ~ surprisal',                                          # 10
+                      'logRTresidual ~ agreement',                                          # 11
+                      'logRTresidual ~ correct_number',                                     # 12
+                      'logRTresidual ~ ')                                                     # 13
+
+participant_effects <- c('(1 + agreement * surprisal + agreement * correct_number | UserId)',
+                         '(1 + agreement * surprisal + correct_number | UserId)',
+                         '(1 + agreement * correct_number + surprisal | UserId)',
+                         '(1 + agreement + correct_number + surprisal | UserId)',
+                         '(1 + agreement * correct_number | UserId)',
+                         '(1 + agreement + correct_number | UserId)',
+                         '(1 + agreement * surprisal | UserId)',
+                         '(1 + agreement + surprisal | UserId)',
+                         '(1 + surprisal + correct_number | UserId)',
+                         '(1 + agreement | UserId)',
+                         '(1 + surprisal | UserId)',
+                         '(1 + correct_number | UserId)',
+                         '(1 | UserId)'
+                         )
+
+item_effects <- c('(1 + agreement * surprisal | set_number )',
+                  '(1 + agreement + surprisal | set_number )',
+                  '(1 + surprisal | set_number )',
+                  '(1 + agreement | set_number )',
+                  '(1 | set_number)'
+                  )
+
+# the random effects formulas
+tmp_fmlas <- list()
+for (randi in 1:length(item_effects)) {
+  for (randp in 1:length(participant_effects)) {
+    
+    tmp_fmla <- sprintf('%s + %s + %s', fixed,  item_effects[[randi]], participant_effects[[randp]])
+    tmp_fmlas <- c(tmp_fmlas, tmp_fmla)
+    
+  }
+}
+```
+## Helper functions
+```{r permutation settings, include=TRUE}
+n_permutations <- 1000
+seed <- 42
+set.seed(seed)
+
+# formula
+permute_lmer <- function(model_orig,
+                         data,
+                         n_permutations,
+                         group_var = "UserId",
+                         response_var = "logRTresidual",
+                         REML=FALSE,
+                         verbose=TRUE){
+  
+  formula <- formula(model_orig)
+  coef_names <- names(fixef(model_orig))
+  obs_coefs <- fixef(model_orig)
+  
+  # storage matrix (rows = perms, cols = fixed effects)
+  perm_matrix <- matrix(NA, nrow = n_permutations, ncol = length(coef_names))
+  colnames(perm_matrix) <- coef_names
+  
+  for (i in 1:n_permutations) {
+    # shuffle labels
+    data_perm <- data %>%
+      group_by(.data[[group_var]]) %>%
+        mutate(
+          !!response_var := sample(.data[[response_var]])
+        ) %>%
+        ungroup()
+    # Fit model to permuted data
+    tryCatch({
+      perm_model <- lmer(formula, data = data_perm, control=lmerControl(optimizer="nloptwrap", optCtrl=list(maxfun=1e6)), REML = REML)
+      perm_matrix[i, ] <- fixef(perm_model)
+    }, error = function(e) {
+      # Skip failed fits
+    })
+    
+    if (verbose && i %% 50 == 0) {
+      message(sprintf("Completed %d / %d permutations", i, n_permutations))
+    }
+    
+  }
+  
+  perm_matrix <- perm_matrix[complete.cases(perm_matrix), , drop = FALSE]
+  
+  p_values <- sapply(seq_along(obs_coefs), function(j) {
+    mean(abs(perm_matrix[, j]) >= abs(obs_coefs[j]))
+  })
+  names(p_values) <- coef_names
+  
+  return(list(
+    observed_coefs = obs_coefs,
+    permuted_coefs = perm_matrix,
+    p_values = p_values
+  ))
+
+}
+
+plot_permutation_densities <- function(result_list) {
+
+  permuted_df <- as.data.frame(result_list$permuted_coefs)
+  observed <- result_list$observed_coefs
+  pvals <- result_list$p_values
+  
+  coef_names <- setdiff(names(permuted_df), "(Intercept)")
+
+  plots <- lapply(coef_names, function(coef_name) {
+    ggplot(permuted_df, aes(x = .data[[coef_name]])) +
+      geom_density(fill = "skyblue", alpha = 0.5) +
+      geom_vline(xintercept = observed[coef_name], color = "red", linewidth = 1) +
+      labs(
+        title = sprintf("%s\n(p = %.3f)", coef_name, pvals[coef_name]),
+        x = "Coefficient value",
+        y = "Density"
+      ) +
+      theme_minimal(base_size=10) +
+      theme(plot.title = element_text(size = 10, hjust = 0.5))  # Center and shrink subplot titles
+  })
+
+    # Combine all plots into one figure
+  combined_plot <- wrap_plots(plots, ncol = length(plots)) +
+    plot_annotation(title = "Permutation Test Distributions for Fixed Effects",
+      theme = theme(plot.title = element_text(hjust = 0.5, size = 14))
+    )
+
+  return(combined_plot)
+}
+
+```
+
+```{r Function count number of random parameters, include=TRUE}
+count_random <- function(mdl) {
+
+  vc_list <- VarCorr(mdl)
+
+  # Count variance components
+  sum(sapply(vc_list, function(v) {
+    n_std  <- length(attr(v, "stddev"))
+    n_corr <- if (!is.null(attr(v, "correlation"))) {
+                length(attr(v, "correlation"))
+              } else 0L
+    n_std + n_corr
+  }))
+}
+
+```
+
+```{r Function random effects, include=TRUE}
+fit_random <- function(tmp_fmla, data) {
+  model <- lmer(tmp_fmla, data, control=lmerControl(optimizer="nloptwrap", optCtrl=list(maxfun=2e5)), REML=FALSE)
+
+}
+
+fit_fixed <- function(tmp_fixed, random, data) {
+  tmp_fmla <- eval(parse(text=paste(tmp_fixed, " + ", random)))
+  model <- lmer(tmp_fmla, data, control=lmerControl(optimizer="nloptwrap", optCtrl=list(maxfun=1e6)), REML=FALSE)
+  
+}
+```
+
+## Random effects - estimation of all models
+### Word index 5 (target)
+```{r Random effects word index 5, include=TRUE, message=FALSE, warning=FALSE}
+models5 <- lapply(tmp_fmlas, fit_random, subset(data, word_index==5))
+saveRDS(models5, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models5CAT.Rdata')
+```
+
+### Word index 6 (spill-over 1)
+```{r Random effects word index 6, include=TRUE, message=FALSE, warning=FALSE}
+models6 <- lapply(tmp_fmlas, fit_random, subset(data, word_index==6))
+saveRDS(models6, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models6CAT.Rdata')
+```
+
+### Word index 6 (spill-over 2)
+```{r Random effects word index 7, include=TRUE, message=FALSE, warning=FALSE}
+models7 <- lapply(tmp_fmlas, fit_random, subset(data, word_index==7))
+saveRDS(models7, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models7CAT.Rdata')
+```
+
+### Word index 6 (spill-over 3)
+```{r Random effects word index 8, include=TRUE, message=FALSE, warning=FALSE}
+models8 <- lapply(tmp_fmlas, fit_random, subset(data, word_index==8))
+saveRDS(models8, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models8CAT.Rdata')
+```
+
+## Evaluating the random models, fixed effects estimation & model selection
+### Word index 5 (target)
+```{r random models index 5, include=TRUE, message=FALSE, warning=FALSE}
+models5 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models5CAT.Rdata')
+
+good_models5 <- list()
+for (mdli in 1:length(models5)) {
+  mdl <- models5[[mdli]]
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    good_models5 <- append(good_models5, mdl)
+  }
+}
+
+# now we sort them for number of variables
+# and their AIC -- we choose the model with the *highest number of variables* and *lowest AIC* combination
+rand_counts <- vapply(good_models5, count_random, integer(1))
+AIC_vals <- sapply(good_models5, AIC)
+nvar = order(-rand_counts)
+aics = order(AIC_vals, decreasing=FALSE)
+
+# now we take the sum of the position of each model
+var_ix = match(1:length(good_models5), nvar)
+aic_ix = match(1:length(good_models5), aics)
+
+score <- var_ix + aic_ix 
+
+sorted_models5 <- good_models5[order(score)]
+
+# we pick the largest one
+start_model5 <- sorted_models5[[1]]
+print(formula(start_model5))
+
+# now we reduce the fixed effects - STEP keeps reducing random effects too
+# so we go back to manual selection
+fixed5 <- lapply(fixed_effects, fit_fixed, "(1 + agreement * surprisal | set_number) + (1 + agreement | 
+    UserId)", subset(data, word_index==5))
+
+# save the fixed models
+saveRDS(fixed5, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/fixed5CAT.Rdata')
+
+final_models5 <- list()
+for (mdli in 1:length(fixed5)) {
+  mdl <- fixed5[[mdli]]
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    final_models5 <- append(final_models5, mdl)
+  }
+}
+
+fixed_aics = sapply(final_models5, AIC)
+best_model5 = final_models5[order(fixed_aics, decreasing=FALSE)][[1]]
+print(formula(best_model5))
+summary(best_model5)
+saveRDS(best_model5, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model5CAT.Rdata')
+```
+#### Permutation test
+```{r permutation5, include=TRUE, message=FALSE, warning=FALSE}
+best_model5 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model5CAT.Rdata')
+perm5 <- permute_lmer(best_model5,
+                      subset(data, word_index==5),
+                      n_permutations,
+                      verbose=TRUE)
+saveRDS(perm5, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/perm55CAT.Rdata')
+```
+
+```{r word index 5 viz permutation, fig.width=7.5,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots5 <- plot_permutation_densities(perm5)
+print(plots5)
+print(perm5$p_values)
+```
+#### Simple effects
+```{r word index 5 EMMEANS, include=TRUE, message=FALSE, warning=FALSE}
+# agreement by number
+mdl5_agr_by_num <- emmeans(best_model5, specs='agreement', by='correct_number')
+
+# number by agreement
+mdl5_num_by_agr <- emmeans(best_model5, specs='correct_number', by='agreement')
+
+# get results without adjustment
+mdl5_agr_by_num_raw <- summary(pairs(mdl5_agr_by_num), adjust='none')
+mdl5_num_by_agr_raw <- summary(pairs(mdl5_num_by_agr), adjust='none')
+
+# extract pvalues
+all_pvals <- c(mdl5_agr_by_num_raw$p.value, mdl5_num_by_agr_raw$p.value)
+adj_pvals <- p.adjust(all_pvals, method='bonferroni')
+
+# extract pvalues
+mdl5_res_pair <- rbind(mdl5_agr_by_num_raw, mdl5_num_by_agr_raw)
+mdl5_res_pair$adj.p.value <- adj_pvals
+summary(mdl5_res_pair)
+``` 
+
+### Word index 6 (spill-over 1)
+```{r Check random models index 6, include=TRUE, message=FALSE, warning=FALSE}
+models6 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models6CAT.Rdata')
+
+good_models6 <- list()
+for (mdli in 1:length(models6)) {
+  mdl <- models6[[mdli]]
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    good_models6 <- append(good_models6, mdl)
+  }
+}
+
+# now we sort them
+rand_counts <- vapply(good_models6, count_random, integer(1))
+AIC_vals <- sapply(good_models6, AIC)
+nvar = order(-rand_counts)
+aics = order(AIC_vals, decreasing=FALSE)
+
+# now we take the sum of the position of each model
+var_ix = match(1:length(good_models6), nvar)
+aic_ix = match(1:length(good_models6), aics)
+score <- var_ix + aic_ix 
+
+sorted_models6 <- good_models6[order(score)]
+
+# we pick the best/largest one
+start_model6 <- sorted_models6[[1]]
+print(formula(start_model6))
+
+# now we reduce the fixed effects - STEP keeps reducing random effects too
+# so we go back to manual selection
+fixed6 <- lapply(fixed_effects, fit_fixed, "(1 + surprisal | set_number) + (1 + agreement | UserId)", subset(data, word_index==6))
+
+# save the fixed models
+saveRDS(fixed6, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/fixed6CAT.Rdata')
+
+# now we check whether they converged
+final_models6 <- list()
+for (mdli in 1:length(fixed6)) {
+  
+  mdl <- fixed6[[mdli]]
+  
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    final_models6 <- append(final_models6, mdl)
+  }
+}
+
+# they did, so we pick the model with the highest AIC
+fixed_aics = sapply(final_models6, AIC)
+best_model6 = final_models6[order(fixed_aics, decreasing=FALSE)][[1]]
+print(formula(best_model6))
+summary(best_model6)
+saveRDS(best_model6, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model6CAT.Rdata')
+```
+#### Permutation test
+```{r permutation6, include=TRUE, message=FALSE, warning=FALSE}
+# load the best model
+best_model6 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model6CAT.Rdata')
+perm6 <- permute_lmer(best_model6,
+                      subset(data, word_index==6),
+                      n_permutations,
+                      verbose=TRUE)
+saveRDS(perm6, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/perm6CAT.Rdata')
+```
+
+```{r word index 6 viz permutation, fig.width=7.5,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots6 <- plot_permutation_densities(perm6)
+print(plots6)
+print(perm6$p_values)
+```
+
+#### Simple effects
+```{r word index 6 EMMEANS, include=TRUE, message=FALSE, warning=FALSE}
+# agreement by number
+mdl6_agr_by_num <- emmeans(best_model6, specs='agreement', by='correct_number')
+
+# number by agreement
+mdl6_num_by_agr <- emmeans(best_model6, specs='correct_number', by='agreement')
+
+
+# get results without adjustment
+mdl6_agr_by_num_raw <- summary(pairs(mdl6_agr_by_num), adjust='none')
+mdl6_num_by_agr_raw <- summary(pairs(mdl6_num_by_agr), adjust='none')
+
+# extract pvalues
+all_pvals <- c(mdl6_agr_by_num_raw$p.value, mdl6_num_by_agr_raw$p.value)
+adj_pvals <- p.adjust(all_pvals, method='bonferroni')
+
+# extract pvalues
+mdl6_res_pair <- rbind(mdl6_agr_by_num_raw, mdl6_num_by_agr_raw)
+mdl6_res_pair$adj.p.value <- adj_pvals
+summary(mdl6_res_pair)
+``` 
+
+### Word index 7 (spill-over 2)
+```{r Check random models index 7, include=TRUE, message=FALSE, warning=FALSE}
+models7 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models7CAT.Rdata')
+
+good_models7 <- list()
+for (mdli in 1:length(models7)) {
+  mdl <- models7[[mdli]]
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    good_models7 <- append(good_models7, mdl)
+  }
+  
+}
+
+# now we sort them
+rand_counts <- vapply(good_models7, count_random, integer(1))
+AIC_vals <- sapply(good_models7, AIC)
+nvar = order(-rand_counts)
+aics = order(AIC_vals, decreasing=FALSE)
+
+# now we take the sum of the position of each model
+var_ix = match(1:length(good_models7), nvar)
+aic_ix = match(1:length(good_models7), aics)
+score <- var_ix + aic_ix 
+
+sorted_models7 <- good_models7[order(score)]
+
+# we pick the best/largest one
+start_model7 <- sorted_models7[[1]]
+print(formula(start_model7))
+
+# now we reduce the fixed effects - STEP keeps reducing random effects too
+# so we go back to manual selection
+fixed7 <- lapply(fixed_effects, fit_fixed, "(1 + agreement + surprisal | set_number) + (1 | UserId)", subset(data, word_index==7))
+
+# save the fixed models
+saveRDS(fixed7, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/fixed7CAT.Rdata')
+
+# now we check whether they converged
+final_models7 <- list()
+for (mdli in 1:length(fixed7)) {
+  mdl <- fixed7[[mdli]]
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    final_models7 <- append(final_models7, mdl)
+  }
+}
+
+# there was only one model left (code not necessary)
+fixed_aics = sapply(final_models7, AIC)
+best_model7 = final_models7[order(fixed_aics, decreasing=FALSE)][[1]]
+print(formula(best_model7))
+summary(best_model7)
+saveRDS(best_model7, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model7CAT.Rdata')
+```
+#### Permutation test
+```{r permutation7, include=TRUE, message=FALSE, warning=FALSE}
+best_model7 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model7CAT.Rdata')
+perm7 <- permute_lmer(best_model7,
+                      subset(data, word_index==7),
+                      n_permutations,
+                      verbose=TRUE)
+saveRDS(perm7, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/perm7CAT.Rdata')
+```
+
+```{r word index 7 viz permutation, fig.width=5,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots7 <- plot_permutation_densities(perm7)
+print(plots7)
+print(perm7$p_values)
+```
+
+### Word index 8 (spill-over 3)
+```{r Check random models index 8, include=TRUE, message=FALSE, warning=FALSE}
+models8 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/models8CAT.Rdata')
+
+good_models8 <- list()
+for (mdli in 1:length(models8)) {
+  mdl <- models8[[mdli]]
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    good_models8 <- append(good_models8, mdl)
+  }
+}
+
+# now we sort them
+rand_counts <- vapply(good_models8, count_random, integer(1))
+AIC_vals <- sapply(good_models8, AIC)
+nvar = order(-rand_counts)
+aics = order(AIC_vals, decreasing=FALSE)
+
+# now we take the sum of the position of each model
+var_ix = match(1:length(good_models8), nvar)
+aic_ix = match(1:length(good_models8), aics)
+score <- var_ix + aic_ix 
+
+sorted_models8 <- good_models8[order(score)]
+
+# we pick the best/largest one
+start_model8 <- sorted_models8[[1]]
+print(formula(start_model8))
+
+# now we reduce the fixed effects - STEP keeps reducing random effects too
+# so we go back to manual selection
+fixed8 <- lapply(fixed_effects, fit_fixed, "(1 + agreement + surprisal | set_number) + (1 + agreement | 
+    UserId)", subset(data, word_index==8))
+
+# save the fixed models
+saveRDS(fixed8, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/fixed8CAT.Rdata')
+
+# now we check whether they converged
+final_models8 <- list()
+for (mdli in 1:length(fixed8)) {
+  
+  mdl <- fixed8[[mdli]]
+  
+  if ((isSingular(mdl) == FALSE)&(mdl@optinfo$conv$opt == 0L)&(is.null(mdl@optinfo$conv$lme4$code))) {
+    final_models8 <- append(final_models8, mdl)
+  }
+}
+
+# they did, so we pick the model with the highest AIC
+fixed_aics = sapply(final_models8, AIC)
+best_model8 = final_models8[order(fixed_aics, decreasing=FALSE)][[1]]
+print(formula(best_model8))
+summary(best_model8)
+saveRDS(best_model8, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model8CAT.Rdata')
+```
+
+#### Permutation test
+```{r word index 8 permutation, include=TRUE, message=FALSE, warning=FALSE}
+best_model8 <- readRDS('C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/best_model8CAT.Rdata')
+perm8 <- permute_lmer(best_model8,
+                      subset(data, word_index==8),
+                      n_permutations,
+                      verbose=TRUE)
+saveRDS(perm8, file='C:/Users/slaats/Documents/MPI/Project/Project 3 - Behavioural studies/3 - SPR main/analysis/perm8')
+
+```
+
+```{r word index 8 viz permutation, fig.width=7.5,fig.height=4, include=TRUE, message=FALSE, warning=FALSE}
+plots8 <- plot_permutation_densities(perm8)
+print(plots8)
+print(perm8$p_values)
+```
